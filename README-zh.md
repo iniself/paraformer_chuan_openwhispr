@@ -4,7 +4,8 @@
 
 这个小项目把 OpenWhispr 的 Self-Hosted 转录请求转交给本机 Sherpa-ONNX，
 使用针对四川话 / 重庆话微调的 Paraformer INT8 模型识别，识别结果再经过
-CT-Transformer 模型恢复中文标点。音频不发送到云端。
+CT-Transformer 模型恢复中文标点，并用内置词表把被模型拆成单字母的英文
+重新合并。音频不发送到云端。
 
 ## 1. 前置条件
 
@@ -54,12 +55,18 @@ brew install ffmpeg
 ```text
 paraformer_chuan_openwhispr/
 ├── paraformer_chuan_shim.py
+├── data/
+│   ├── english_words.txt.gz
+│   └── README.md
 ├── sherpa-onnx-paraformer-zh-int8-2025-10-07/
 │   ├── model.int8.onnx
 │   └── tokens.txt
 └── sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8/
     └── model.int8.onnx
 ```
+
+英文词表已经随项目一起提供，不需要额外下载，断网也能使用。词表来源和许可
+见 [`data/README.md`](data/README.md)。
 
 也可以通过环境变量 `PARAFORMER_MODEL_DIR` 和 `PUNCTUATION_MODEL_DIR`
 指定其他模型目录。
@@ -107,7 +114,38 @@ export SHIM_HOST=127.0.0.1
 export SHIM_PORT=8765
 ```
 
-## 7. 本地接口自测
+## 7. 英文空格修复
+
+中文 Paraformer 有时会把一个英文单词拆成单字母输出，例如 `我 l o v e 你`。
+Shim 会用内置的 3 万词频表把这些片段重新拼回去：
+
+```text
+我 l o v e 你        -> 我 love 你
+i l o v e y o u      -> i love you
+h e l l o w o r l d  -> hello world
+```
+
+只处理“单个字母 + 空格”的片段，正常英文不会被改动。该功能完全离线运行，
+不依赖系统词典。
+
+上面的例子展示的是标点恢复前的效果。标点模型可能会去掉中英文之间的空格，
+因此最终结果可能是 `我love你。`。
+
+关闭该功能：
+
+```bash
+export ENGLISH_SPACING_FIX=0
+```
+
+使用自定义词表（每行一个单词，普通文本或 gzip 压缩均可）：
+
+```bash
+export ENGLISH_WORDS_PATH="$HOME/Models/english_words.txt.gz"
+```
+
+如果词表文件不存在，Shim 会跳过这一步，不影响正常识别。
+
+## 8. 本地接口自测
 
 服务启动后，可用一段音频测试（把 `sample.wav` 换成自己的音频文件）：
 
@@ -132,3 +170,4 @@ curl http://localhost:8765/models
 - 这是 OpenWhispr 的批量转录接口：说完松开快捷键后再识别，不是逐字实时字幕。
 - OpenWhispr 自身、Shim、FFmpeg、Sherpa-ONNX、标点模型和识别模型均在本机运行，音频和识别文本都不会离开本机。
 - 模型主要针对川渝方言微调，但实际效果仍应使用你自己的录音验证。
+- 英文空格修复只改善格式。如果模型把字母本身听错（例如把 `you` 听成 `e u`），文字仍然是错的。经常整句中英混说时，建议换用双语 ASR 模型。

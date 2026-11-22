@@ -5,8 +5,9 @@ English | [中文](README-zh.md)
 This small project forwards OpenWhispr's Self-Hosted transcription requests to a
 local Sherpa-ONNX server. Speech is recognized with a Paraformer INT8 model
 fine-tuned for the Sichuan/Chongqing dialect, and the result is passed through a
-CT-Transformer model to restore Chinese punctuation. Audio is never sent to the
-cloud.
+CT-Transformer model to restore Chinese punctuation. English words that the
+model emits as separate letters are re-joined using a bundled word list. Audio
+is never sent to the cloud.
 
 ## 1. Prerequisites
 
@@ -62,12 +63,19 @@ By default, both model directories must sit next to `paraformer_chuan_shim.py`:
 ```text
 paraformer_chuan_openwhispr/
 ├── paraformer_chuan_shim.py
+├── data/
+│   ├── english_words.txt.gz
+│   └── README.md
 ├── sherpa-onnx-paraformer-zh-int8-2025-10-07/
 │   ├── model.int8.onnx
 │   └── tokens.txt
 └── sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8/
     └── model.int8.onnx
 ```
+
+The English word list is bundled with the project, so no extra download is
+needed and the spacing fix works offline. See [`data/README.md`](data/README.md)
+for its source and license.
 
 You can point to other model directories with the `PARAFORMER_MODEL_DIR` and
 `PUNCTUATION_MODEL_DIR` environment variables.
@@ -116,7 +124,40 @@ export SHIM_HOST=127.0.0.1
 export SHIM_PORT=8765
 ```
 
-## 7. Test the Local API
+## 7. English Spacing Normalization
+
+The Chinese Paraformer model sometimes emits an English word as separate
+letters, for example `我 l o v e 你`. The shim re-joins these runs with the
+bundled 30,000-word frequency list:
+
+```text
+我 l o v e 你        -> 我 love 你
+i l o v e y o u      -> i love you
+h e l l o w o r l d  -> hello world
+```
+
+Only runs of space-separated single letters are changed; normal English text is
+left untouched. This works offline and does not depend on a system dictionary.
+
+The examples above show the text after spacing normalization and before
+punctuation restoration. The punctuation model may remove spaces between
+Chinese and English, so the final text can be `我love你。`.
+
+To disable it:
+
+```bash
+export ENGLISH_SPACING_FIX=0
+```
+
+To use your own word list (one word per line, plain text or gzip-compressed):
+
+```bash
+export ENGLISH_WORDS_PATH="$HOME/Models/english_words.txt.gz"
+```
+
+If the word list is missing, the shim skips this step and keeps working.
+
+## 8. Test the Local API
 
 With the server running, test it with an audio file (replace `sample.wav` with
 your own recording):
@@ -145,3 +186,7 @@ curl http://localhost:8765/models
   locally on your machine.
 - The model is mainly fine-tuned for the Sichuan/Chongqing dialect, but you
   should still verify actual accuracy with your own recordings.
+- English spacing normalization only repairs formatting. If the model
+  misrecognizes the letters themselves (for example `you` as `e u`), the text
+  will still be wrong. For heavy Chinese-English code-switching, consider a
+  bilingual ASR model.

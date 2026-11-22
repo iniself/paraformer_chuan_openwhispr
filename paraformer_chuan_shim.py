@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import array
+import gzip
 import json
+import math
 import os
 import re
 import subprocess
@@ -37,6 +39,16 @@ PUNCTUATION_MODEL_DIR = Path(os.environ.get(
 )).expanduser().resolve()
 
 PUNCTUATION_MODEL_PATH = PUNCTUATION_MODEL_DIR / "model.int8.onnx"
+
+# [新增] 英文单字母空格修复配置
+ENGLISH_SPACING_FIX = os.environ.get(
+    "ENGLISH_SPACING_FIX", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+
+ENGLISH_WORDS_PATH = Path(os.environ.get(
+    "ENGLISH_WORDS_PATH",
+    str(Path(__file__).resolve().parent / "data" / "english_words.txt.gz"),
+)).expanduser().resolve()
 
 
 def create_recognizer():
@@ -90,6 +102,132 @@ PUNCTUATOR = create_punctuator()
 
 # [新增] 避免多个请求同时调用同一个标点模型实例
 PUNCTUATION_LOCK = threading.Lock()
+
+# [新增] 英文单字母空格修复状态
+_ENGLISH_WORDS_LOCK = threading.Lock()
+_ENGLISH_WORD_COSTS: dict[str, float] | None = None
+_ENGLISH_WORD_MAX_LEN = 0
+_ENGLISH_WORDS_LOAD_FAILED = False
+
+LETTER_RUN_RE = re.compile(
+    r"(?<![A-Za-z])(?:[A-Za-z][ \t]+)+[A-Za-z](?![A-Za-z])"
+)
+
+
+def load_english_words() -> dict[str, float] | None:
+    """Load the bundled English word list once, on first use."""
+    global _ENGLISH_WORD_COSTS, _ENGLISH_WORD_MAX_LEN, _ENGLISH_WORDS_LOAD_FAILED
+
+    if _ENGLISH_WORD_COSTS is not None or _ENGLISH_WORDS_LOAD_FAILED:
+        return _ENGLISH_WORD_COSTS
+
+    with _ENGLISH_WORDS_LOCK:
+        if _ENGLISH_WORD_COSTS is not None or _ENGLISH_WORDS_LOAD_FAILED:
+            return _ENGLISH_WORD_COSTS
+
+        path = ENGLISH_WORDS_PATH
+        if not path.is_file():
+            print(f"English word list not found: {path}")
+            print("English letter spacing fix is disabled.")
+            _ENGLISH_WORDS_LOAD_FAILED = True
+            return None
+
+        try:
+            opener = gzip.open if path.suffix == ".gz" else open
+            with opener(path, "rt", encoding="utf-8") as word_file:
+                words = [
+                    line.strip().lower()
+                    for line in word_file
+                    if line.strip()
+                ]
+        except (OSError, UnicodeError) as exc:
+            print(f"Failed to load English word list: {exc}")
+            print("English letter spacing fix is disabled.")
+            _ENGLISH_WORDS_LOAD_FAILED = True
+            return None
+
+        words = [word for word in words if word.isalpha()]
+        if not words:
+            print(f"English word list is empty: {path}")
+            print("English letter spacing fix is disabled.")
+            _ENGLISH_WORDS_LOAD_FAILED = True
+            return None
+
+        # Words are ordered by frequency, so earlier words get a lower cost.
+        log_word_count = max(math.log(len(words)), 1.0)
+        costs: dict[str, float] = {}
+        for index, word in enumerate(words):
+            costs.setdefault(word, math.log((index + 1) * log_word_count))
+
+        _ENGLISH_WORD_COSTS = costs
+        _ENGLISH_WORD_MAX_LEN = max(len(word) for word in costs)
+        print(f"English word list loaded: {len(costs)} words")
+        return _ENGLISH_WORD_COSTS
+
+
+def _segment_english_letters(
+    letters: str,
+    costs: dict[str, float],
+    max_word_len: int,
+) -> str | None:
+    """Split a run of letters into the most likely English words."""
+    length = len(letters)
+    best = [math.inf] * (length + 1)
+    best[0] = 0.0
+    previous = [0] * (length + 1)
+
+    for end in range(1, length + 1):
+        for start in range(max(0, end - max_word_len), end):
+            word = letters[start:end].lower()
+            cost = costs.get(word)
+            if cost is None:
+                continue
+
+            if len(word) == 1:
+                # Only allow "a" and "i", and make them less attractive than
+                # a real word such as "ai", "am", or "is".
+                if word not in ("a", "i"):
+                    continue
+                cost += 5.0
+
+            candidate = best[start] + cost
+            if candidate < best[end]:
+                best[end] = candidate
+                previous[end] = start
+
+    if best[length] == math.inf:
+        return None
+
+    words = []
+    end = length
+    while end > 0:
+        start = previous[end]
+        words.append(letters[start:end].lower())
+        end = start
+
+    return " ".join(reversed(words))
+
+
+def normalize_english_spacing(text: str) -> str:
+    """Join English words that the ASR model emitted as separate letters."""
+    if not ENGLISH_SPACING_FIX or not text:
+        return text
+
+    costs = load_english_words()
+    if not costs:
+        return text
+
+    def replace(match: re.Match[str]) -> str:
+        letters = "".join(match.group(0).split())
+        if len(letters) < 2:
+            return match.group(0)
+
+        normalized = _segment_english_letters(
+            letters, costs, _ENGLISH_WORD_MAX_LEN
+        )
+        return normalized or match.group(0)
+
+    return LETTER_RUN_RE.sub(replace, text)
 
 
 def parse_multipart_form(body: bytes, content_type: str):
@@ -190,6 +328,9 @@ def transcribe(audio_path: str, model: str = "", language=None, prompt=None) -> 
 
     # 原有 Paraformer 识别结果
     transcript = stream.result.text.strip()
+
+    # [新增] 合并被模型拆成单字母的英文，例如 "l o v e" -> "love"
+    transcript = normalize_english_spacing(transcript)
 
     # [新增] 对识别结果进行中文标点恢复
     if transcript:
