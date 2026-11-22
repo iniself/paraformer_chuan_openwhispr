@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import array
+import configparser
 import gzip
 import json
 import math
@@ -19,36 +20,144 @@ from pathlib import Path
 import sherpa_onnx
 
 
-PORT = int(os.environ.get("SHIM_PORT", "8765"))
-HOST = os.environ.get("SHIM_HOST", "127.0.0.1")
+PROJECT_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = Path(os.environ.get(
+    "CONFIG_PATH",
+    str(PROJECT_DIR / "config.ini"),
+)).expanduser()
+if not CONFIG_PATH.is_absolute():
+    CONFIG_PATH = PROJECT_DIR / CONFIG_PATH
+CONFIG_PATH = CONFIG_PATH.resolve()
+
+
+def load_config() -> configparser.ConfigParser:
+    """Load config.ini if present. Environment variables override it later."""
+    parser = configparser.ConfigParser(
+        interpolation=None,
+        inline_comment_prefixes=("#", ";"),
+    )
+    if not CONFIG_PATH.is_file():
+        return parser
+
+    try:
+        with CONFIG_PATH.open(encoding="utf-8") as config_file:
+            parser.read_file(config_file)
+    except (OSError, UnicodeError, configparser.Error) as exc:
+        raise SystemExit(
+            f"Failed to read config file {CONFIG_PATH}: {exc}"
+        ) from exc
+
+    return parser
+
+
+_CONFIG = load_config()
+BASE_DIR = CONFIG_PATH.parent if CONFIG_PATH.is_file() else PROJECT_DIR
+
+
+def get_setting(env_name: str, section: str, option: str, default: str) -> str:
+    """Return the environment variable, then config.ini, then the default."""
+    if env_name in os.environ:
+        return os.environ[env_name]
+    return _CONFIG.get(section, option, fallback=default)
+
+
+def get_int_setting(
+    env_name: str,
+    section: str,
+    option: str,
+    default: int,
+) -> int:
+    raw = get_setting(env_name, section, option, str(default)).strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise SystemExit(
+            f"Invalid integer for {env_name} or [{section}] {option}: {raw!r}"
+        ) from exc
+
+
+def get_bool_setting(
+    env_name: str,
+    section: str,
+    option: str,
+    default: bool,
+) -> bool:
+    raw = get_setting(
+        env_name, section, option, "true" if default else "false"
+    ).strip().lower()
+    if not raw:
+        return default
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise SystemExit(
+        f"Invalid boolean for {env_name} or [{section}] {option}: {raw!r}"
+    )
+
+
+def get_path_setting(
+    env_name: str,
+    section: str,
+    option: str,
+    default: Path,
+) -> Path:
+    raw = get_setting(env_name, section, option, str(default)).strip()
+    if not raw:
+        raw = str(default)
+
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = BASE_DIR / path
+    return path.resolve()
+
+
+PORT = get_int_setting("SHIM_PORT", "server", "port", 8765)
+HOST = get_setting("SHIM_HOST", "server", "host", "127.0.0.1").strip()
+if not HOST:
+    HOST = "127.0.0.1"
+if not 0 < PORT < 65536:
+    raise SystemExit(f"Invalid port: {PORT}")
+
 MAX_BODY_BYTES = 25 * 1024 * 1024
 
-MODEL_DIR = Path(os.environ.get(
+MODEL_DIR = get_path_setting(
     "PARAFORMER_MODEL_DIR",
-    "./sherpa-onnx-paraformer-zh-int8-2025-10-07",
-)).expanduser().resolve()
+    "models",
+    "paraformer_dir",
+    PROJECT_DIR / "sherpa-onnx-paraformer-zh-int8-2025-10-07",
+)
 
 MODEL_PATH = MODEL_DIR / "model.int8.onnx"
 TOKENS_PATH = MODEL_DIR / "tokens.txt"
-NUM_THREADS = int(os.environ.get("SHERPA_NUM_THREADS", "2"))
+NUM_THREADS = get_int_setting("SHERPA_NUM_THREADS", "models", "num_threads", 2)
+if NUM_THREADS < 1:
+    raise SystemExit(f"num_threads must be at least 1, got {NUM_THREADS}")
 
 # [新增] 中文标点恢复模型配置
-PUNCTUATION_MODEL_DIR = Path(os.environ.get(
+PUNCTUATION_MODEL_DIR = get_path_setting(
     "PUNCTUATION_MODEL_DIR",
-    "./sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8",
-)).expanduser().resolve()
+    "models",
+    "punctuation_dir",
+    PROJECT_DIR / "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8",
+)
 
 PUNCTUATION_MODEL_PATH = PUNCTUATION_MODEL_DIR / "model.int8.onnx"
 
 # [新增] 英文单字母空格修复配置
-ENGLISH_SPACING_FIX = os.environ.get(
-    "ENGLISH_SPACING_FIX", "1"
-).strip().lower() not in ("0", "false", "no", "off")
+ENGLISH_SPACING_FIX = get_bool_setting("ENGLISH_SPACING_FIX", "english", "fix", True)
 
-ENGLISH_WORDS_PATH = Path(os.environ.get(
+ENGLISH_WORDS_PATH = get_path_setting(
     "ENGLISH_WORDS_PATH",
-    str(Path(__file__).resolve().parent / "data" / "english_words.txt.gz"),
-)).expanduser().resolve()
+    "english",
+    "words_path",
+    PROJECT_DIR / "data" / "english_words.txt.gz",
+)
+
+if CONFIG_PATH.is_file():
+    print(f"Using config file: {CONFIG_PATH}")
 
 
 def create_recognizer():

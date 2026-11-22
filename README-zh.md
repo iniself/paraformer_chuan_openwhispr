@@ -55,6 +55,7 @@ brew install ffmpeg
 ```text
 paraformer_chuan_openwhispr/
 ├── paraformer_chuan_shim.py
+├── config.example.ini
 ├── data/
 │   ├── english_words.txt.gz
 │   └── README.md
@@ -68,10 +69,49 @@ paraformer_chuan_openwhispr/
 英文词表已经随项目一起提供，不需要额外下载，断网也能使用。词表来源和许可
 见 [`data/README.md`](data/README.md)。
 
-也可以通过环境变量 `PARAFORMER_MODEL_DIR` 和 `PUNCTUATION_MODEL_DIR`
-指定其他模型目录。
+也可以在 `config.ini` 中通过 `models.paraformer_dir` 和
+`models.punctuation_dir` 指定其他模型目录（或使用环境变量
+`PARAFORMER_MODEL_DIR` 和 `PUNCTUATION_MODEL_DIR`）。
 
-## 4. 启动
+## 4. 配置 Shim
+
+所有用户配置都放在一个 INI 文件里。先复制示例文件：
+
+```bash
+cp config.example.ini config.ini
+```
+
+然后编辑 `config.ini`：
+
+```ini
+[server]
+host = 127.0.0.1
+port = 8765
+
+[models]
+paraformer_dir = ./sherpa-onnx-paraformer-zh-int8-2025-10-07
+punctuation_dir = ./sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8
+num_threads = 2
+
+[english]
+fix = true
+words_path =
+```
+
+`config.ini` 不会被 Git 跟踪，`config.example.ini` 是模板。
+
+- 相对路径相对于 `config.ini` 所在目录解析（通常就是项目根目录）。
+- 支持 `~`，但不会展开 `$HOME` 这类 shell 变量。配置里请用绝对路径或
+  `~/...`。
+- 环境变量优先级高于 `config.ini`。
+- 没有 `config.ini` 时使用内置默认值。
+- 如果配置文件放在其他位置：
+
+```bash
+export CONFIG_PATH="$HOME/.config/paraformer-chuan.ini"
+```
+
+## 5. 启动
 
 在项目目录执行：
 
@@ -83,7 +123,7 @@ source .venv/bin/activate && python paraformer_chuan_shim.py
 就绪后会显示 `Paraformer model loaded.` 和 `Punctuation model loaded.`。
 保持这个终端窗口运行。
 
-## 5. 配置 OpenWhispr
+## 6. 配置 OpenWhispr
 
 打开 Settings → Transcription → Self-Hosted：
 
@@ -92,29 +132,33 @@ source .venv/bin/activate && python paraformer_chuan_shim.py
 
 保存后，OpenWhispr 的录音会发到本机服务，识别结果再返回 OpenWhispr。
 
-## 6. 可选设置
+## 7. 环境变量覆盖
 
-例如把模型放在其他位置：
+推荐用 `config.ini` 修改配置。环境变量仍然可用，并且优先级高于配置文件，
+适合临时调试或脚本启动。
+
+| 配置项 | 环境变量 |
+|---|---|
+| `server.host` | `SHIM_HOST` |
+| `server.port` | `SHIM_PORT` |
+| `models.paraformer_dir` | `PARAFORMER_MODEL_DIR` |
+| `models.punctuation_dir` | `PUNCTUATION_MODEL_DIR` |
+| `models.num_threads` | `SHERPA_NUM_THREADS` |
+| `english.fix` | `ENGLISH_SPACING_FIX` |
+| `english.words_path` | `ENGLISH_WORDS_PATH` |
+| 配置文件位置 | `CONFIG_PATH` |
+
+示例：
 
 ```bash
-export PARAFORMER_MODEL_DIR="$HOME/Models/sherpa-onnx-paraformer-zh-int8-2025-10-07"
-export PUNCTUATION_MODEL_DIR="$HOME/Models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"
-```
-
-调整 CPU 线程数（默认 2）：
-
-```bash
+export SHIM_PORT=9000
 export SHERPA_NUM_THREADS=4
+export ENGLISH_SPACING_FIX=0
 ```
 
-修改监听地址或端口（默认 `127.0.0.1:8765`）：
+设置了环境变量时，会覆盖 `config.ini` 中的同名配置。
 
-```bash
-export SHIM_HOST=127.0.0.1
-export SHIM_PORT=8765
-```
-
-## 7. 英文空格修复
+## 8. 英文空格修复
 
 中文 Paraformer 有时会把一个英文单词拆成单字母输出，例如 `我 l o v e 你`。
 Shim 会用内置的 3 万词频表把这些片段重新拼回去：
@@ -131,21 +175,25 @@ h e l l o w o r l d  -> hello world
 上面的例子展示的是标点恢复前的效果。标点模型可能会去掉中英文之间的空格，
 因此最终结果可能是 `我love你。`。
 
-关闭该功能：
+关闭该功能，在 `config.ini` 中设置：
 
-```bash
-export ENGLISH_SPACING_FIX=0
+```ini
+[english]
+fix = false
 ```
 
 使用自定义词表（每行一个单词，普通文本或 gzip 压缩均可）：
 
-```bash
-export ENGLISH_WORDS_PATH="$HOME/Models/english_words.txt.gz"
+```ini
+[english]
+words_path = /Users/you/Models/english_words.txt.gz
 ```
+
+也可以用 `ENGLISH_SPACING_FIX` 和 `ENGLISH_WORDS_PATH` 环境变量临时覆盖。
 
 如果词表文件不存在，Shim 会跳过这一步，不影响正常识别。
 
-## 8. 本地接口自测
+## 9. 本地接口自测
 
 服务启动后，可用一段音频测试（把 `sample.wav` 换成自己的音频文件）：
 

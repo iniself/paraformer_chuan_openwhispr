@@ -63,6 +63,7 @@ By default, both model directories must sit next to `paraformer_chuan_shim.py`:
 ```text
 paraformer_chuan_openwhispr/
 ├── paraformer_chuan_shim.py
+├── config.example.ini
 ├── data/
 │   ├── english_words.txt.gz
 │   └── README.md
@@ -77,10 +78,50 @@ The English word list is bundled with the project, so no extra download is
 needed and the spacing fix works offline. See [`data/README.md`](data/README.md)
 for its source and license.
 
-You can point to other model directories with the `PARAFORMER_MODEL_DIR` and
-`PUNCTUATION_MODEL_DIR` environment variables.
+You can point to other model directories with `models.paraformer_dir` and
+`models.punctuation_dir` in `config.ini` (or the `PARAFORMER_MODEL_DIR` and
+`PUNCTUATION_MODEL_DIR` environment variables).
 
-## 4. Start the Server
+## 4. Configure the Shim
+
+All user-facing settings live in one INI file. Copy the example once:
+
+```bash
+cp config.example.ini config.ini
+```
+
+Then edit `config.ini`:
+
+```ini
+[server]
+host = 127.0.0.1
+port = 8765
+
+[models]
+paraformer_dir = ./sherpa-onnx-paraformer-zh-int8-2025-10-07
+punctuation_dir = ./sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8
+num_threads = 2
+
+[english]
+fix = true
+words_path =
+```
+
+`config.ini` is not tracked by Git; `config.example.ini` is the template.
+
+- Relative paths are resolved against the directory containing `config.ini`
+  (normally the project root).
+- `~` is expanded, but shell variables such as `$HOME` are not. Use an absolute
+  path or `~/...` inside `config.ini`.
+- Environment variables override values in `config.ini` when set.
+- If `config.ini` is missing, the built-in defaults are used.
+- To use a config file somewhere else:
+
+```bash
+export CONFIG_PATH="$HOME/.config/paraformer-chuan.ini"
+```
+
+## 5. Start the Server
 
 From the project directory:
 
@@ -92,7 +133,7 @@ On the first start, the ~227 MB Paraformer model is loaded, followed by the
 punctuation model. Once both are ready you will see `Paraformer model loaded.`
 and `Punctuation model loaded.` Keep this terminal running.
 
-## 5. Configure OpenWhispr
+## 6. Configure OpenWhispr
 
 Open Settings → Transcription → Self-Hosted:
 
@@ -102,29 +143,34 @@ Open Settings → Transcription → Self-Hosted:
 After saving, OpenWhispr recordings are sent to the local service, and the
 recognized text is returned to OpenWhispr.
 
-## 6. Optional Settings
+## 7. Environment Variable Overrides
 
-For example, to keep the models somewhere else:
+`config.ini` is the recommended way to change settings. Environment variables
+are still supported and take precedence over the config file, which is useful
+for temporary or per-process changes.
+
+| Config setting | Environment variable |
+|---|---|
+| `server.host` | `SHIM_HOST` |
+| `server.port` | `SHIM_PORT` |
+| `models.paraformer_dir` | `PARAFORMER_MODEL_DIR` |
+| `models.punctuation_dir` | `PUNCTUATION_MODEL_DIR` |
+| `models.num_threads` | `SHERPA_NUM_THREADS` |
+| `english.fix` | `ENGLISH_SPACING_FIX` |
+| `english.words_path` | `ENGLISH_WORDS_PATH` |
+| config file location | `CONFIG_PATH` |
+
+Examples:
 
 ```bash
-export PARAFORMER_MODEL_DIR="$HOME/Models/sherpa-onnx-paraformer-zh-int8-2025-10-07"
-export PUNCTUATION_MODEL_DIR="$HOME/Models/sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8"
-```
-
-To adjust the number of CPU threads (default is 2):
-
-```bash
+export SHIM_PORT=9000
 export SHERPA_NUM_THREADS=4
+export ENGLISH_SPACING_FIX=0
 ```
 
-To change the listening address or port (defaults are `127.0.0.1:8765`):
+When an environment variable is set, it wins over the value in `config.ini`.
 
-```bash
-export SHIM_HOST=127.0.0.1
-export SHIM_PORT=8765
-```
-
-## 7. English Spacing Normalization
+## 8. English Spacing Normalization
 
 The Chinese Paraformer model sometimes emits an English word as separate
 letters, for example `我 l o v e 你`. The shim re-joins these runs with the
@@ -143,21 +189,26 @@ The examples above show the text after spacing normalization and before
 punctuation restoration. The punctuation model may remove spaces between
 Chinese and English, so the final text can be `我love你。`.
 
-To disable it:
+To disable it, set this in `config.ini`:
 
-```bash
-export ENGLISH_SPACING_FIX=0
+```ini
+[english]
+fix = false
 ```
 
 To use your own word list (one word per line, plain text or gzip-compressed):
 
-```bash
-export ENGLISH_WORDS_PATH="$HOME/Models/english_words.txt.gz"
+```ini
+[english]
+words_path = /Users/you/Models/english_words.txt.gz
 ```
+
+You can also override these values with `ENGLISH_SPACING_FIX` and
+`ENGLISH_WORDS_PATH`.
 
 If the word list is missing, the shim skips this step and keeps working.
 
-## 8. Test the Local API
+## 9. Test the Local API
 
 With the server running, test it with an audio file (replace `sample.wav` with
 your own recording):
