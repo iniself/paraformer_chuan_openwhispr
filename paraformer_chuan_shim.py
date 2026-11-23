@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Local OpenWhispr ASR shim using the Sichuan/Chongqing Paraformer model."""
+"""Local OpenWhispr ASR shim with Paraformer and SenseVoice engines."""
 
 from __future__ import annotations
 
@@ -123,6 +123,22 @@ if not 0 < PORT < 65536:
 
 MAX_BODY_BYTES = 25 * 1024 * 1024
 
+# Recognition engine: "paraformer" (Sichuan/Chongqing) or "sense_voice".
+ENGINE_ALIASES = {
+    "paraformer": "paraformer",
+    "paraformer-chuan": "paraformer",
+    "sense_voice": "sense_voice",
+    "sense-voice": "sense_voice",
+    "sensevoice": "sense_voice",
+}
+ENGINE = get_setting("ASR_ENGINE", "models", "engine", "paraformer").strip().lower()
+if ENGINE not in ENGINE_ALIASES:
+    raise SystemExit(
+        "Invalid engine for ASR_ENGINE or [models] engine: "
+        f"{ENGINE!r} (expected 'paraformer' or 'sense_voice')"
+    )
+ENGINE = ENGINE_ALIASES[ENGINE]
+
 MODEL_DIR = get_path_setting(
     "PARAFORMER_MODEL_DIR",
     "models",
@@ -146,6 +162,54 @@ PUNCTUATION_MODEL_DIR = get_path_setting(
 
 PUNCTUATION_MODEL_PATH = PUNCTUATION_MODEL_DIR / "model.int8.onnx"
 
+# SenseVoice model settings. They are ignored when engine = paraformer.
+SENSE_VOICE_MODEL_DIR = get_path_setting(
+    "SENSE_VOICE_MODEL_DIR",
+    "models",
+    "sense_voice_dir",
+    PROJECT_DIR / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2024-07-17",
+)
+
+SENSE_VOICE_MODEL_PATH = SENSE_VOICE_MODEL_DIR / "model.int8.onnx"
+SENSE_VOICE_TOKENS_PATH = SENSE_VOICE_MODEL_DIR / "tokens.txt"
+SENSE_VOICE_LANGUAGE = (
+    get_setting("SENSE_VOICE_LANGUAGE", "models", "sense_voice_language", "auto")
+    .strip()
+    or "auto"
+)
+SENSE_VOICE_USE_ITN = get_bool_setting(
+    "SENSE_VOICE_USE_ITN", "models", "sense_voice_use_itn", True
+)
+
+# Punctuation handling: auto, always, or never.
+PUNCTUATION_MODE = (
+    get_setting("PUNCTUATION_MODE", "models", "punctuation", "auto").strip().lower()
+    or "auto"
+)
+if PUNCTUATION_MODE not in ("auto", "always", "never"):
+    raise SystemExit(
+        "Invalid punctuation mode for PUNCTUATION_MODE or [models] punctuation: "
+        f"{PUNCTUATION_MODE!r} (expected 'auto', 'always' or 'never')"
+    )
+
+# Model id reported by /models. The shim ignores the requested model name, so
+# OpenWhispr keeps working with either id.
+ENGINE_MODEL_ID = "paraformer-chuan" if ENGINE == "paraformer" else "sense-voice"
+
+
+def sense_voice_adds_punctuation() -> bool:
+    """SenseVoice outputs punctuation itself when ITN is enabled."""
+    return ENGINE == "sense_voice" and SENSE_VOICE_USE_ITN
+
+
+def should_run_punctuator() -> bool:
+    """Decide whether the standalone punctuation model is needed."""
+    if PUNCTUATION_MODE == "never":
+        return False
+    if PUNCTUATION_MODE == "always":
+        return True
+    return not sense_voice_adds_punctuation()
+
 # [新增] 英文单字母空格修复配置
 ENGLISH_SPACING_FIX = get_bool_setting("ENGLISH_SPACING_FIX", "english", "fix", True)
 
@@ -161,7 +225,36 @@ if CONFIG_PATH.is_file():
 
 
 def create_recognizer():
-    """Load the offline Sichuan/Chongqing Paraformer once at startup."""
+    """Load the configured offline recognizer once at startup."""
+    if ENGINE == "sense_voice":
+        if not SENSE_VOICE_MODEL_PATH.is_file():
+            raise FileNotFoundError(
+                f"Model file not found: {SENSE_VOICE_MODEL_PATH}"
+            )
+        if not SENSE_VOICE_TOKENS_PATH.is_file():
+            raise FileNotFoundError(
+                f"Tokens file not found: {SENSE_VOICE_TOKENS_PATH}"
+            )
+
+        print(f"Loading SenseVoice model from: {SENSE_VOICE_MODEL_DIR}")
+        recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=str(SENSE_VOICE_MODEL_PATH),
+            tokens=str(SENSE_VOICE_TOKENS_PATH),
+            num_threads=NUM_THREADS,
+            sample_rate=16000,
+            feature_dim=80,
+            decoding_method="greedy_search",
+            provider="cpu",
+            language=SENSE_VOICE_LANGUAGE,
+            use_itn=SENSE_VOICE_USE_ITN,
+        )
+        print(
+            "SenseVoice model loaded "
+            f"(language={SENSE_VOICE_LANGUAGE}, "
+            f"use_itn={SENSE_VOICE_USE_ITN})."
+        )
+        return recognizer
+
     if not MODEL_PATH.is_file():
         raise FileNotFoundError(f"Model file not found: {MODEL_PATH}")
     if not TOKENS_PATH.is_file():
@@ -206,8 +299,17 @@ def create_punctuator():
 
 RECOGNIZER = create_recognizer()
 
-# [新增] 服务启动时只加载一次标点模型
-PUNCTUATOR = create_punctuator()
+# Load the punctuation model once at startup; skip it entirely when unused.
+if should_run_punctuator():
+    PUNCTUATOR = create_punctuator()
+else:
+    PUNCTUATOR = None
+    reason = (
+        "punctuation = never"
+        if PUNCTUATION_MODE == "never"
+        else "SenseVoice already adds punctuation (use_itn = true)"
+    )
+    print(f"Skipping punctuation model: {reason}.")
 
 # [新增] 避免多个请求同时调用同一个标点模型实例
 PUNCTUATION_LOCK = threading.Lock()
@@ -408,7 +510,7 @@ def convert_audio(input_path: str) -> str:
 
 
 def transcribe(audio_path: str, model: str = "", language=None, prompt=None) -> str:
-    """Run local Paraformer inference and restore punctuation."""
+    """Run local ASR and optionally restore punctuation."""
     with wave.open(audio_path, "rb") as wav:
         channels = wav.getnchannels()
         sample_width = wav.getsampwidth()
@@ -435,14 +537,14 @@ def transcribe(audio_path: str, model: str = "", language=None, prompt=None) -> 
     stream.accept_waveform(16000, audio)
     RECOGNIZER.decode_stream(stream)
 
-    # 原有 Paraformer 识别结果
+    # Raw recognizer output (Paraformer or SenseVoice)
     transcript = stream.result.text.strip()
 
     # [新增] 合并被模型拆成单字母的英文，例如 "l o v e" -> "love"
     transcript = normalize_english_spacing(transcript)
 
     # [新增] 对识别结果进行中文标点恢复
-    if transcript:
+    if transcript and PUNCTUATOR is not None:
         with PUNCTUATION_LOCK:
             transcript = PUNCTUATOR.add_punctuation(transcript)
 
@@ -526,14 +628,20 @@ class ShimHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         if self.path.rstrip("/") in ("/models", "/v1/models"):
+            # The shim ignores the requested model name, so both ids are
+            # listed to keep existing OpenWhispr settings valid.
+            model_ids = [ENGINE_MODEL_ID]
+            if ENGINE_MODEL_ID != "paraformer-chuan":
+                model_ids.append("paraformer-chuan")
             self._send_json(200, {
                 "object": "list",
                 "data": [
                     {
-                        "id": "paraformer-chuan",
+                        "id": model_id,
                         "object": "model",
                         "owned_by": "local"
                     }
+                    for model_id in model_ids
                 ]
             })
         else:
@@ -546,10 +654,13 @@ class ShimHandler(BaseHTTPRequestHandler):
 def main():
     server = ThreadingHTTPServer((HOST, PORT), ShimHandler)
     server.daemon_threads = True
-    print(f"OpenWhispr Paraformer shim: http://localhost:{PORT}")
+    print(f"OpenWhispr ASR shim: http://localhost:{PORT}")
     print("OpenWhispr setting: Transcription -> Self-Hosted")
     print(f"Server URL: http://localhost:{PORT}")
-    print("Model: paraformer-chuan")
+    print(f"Model: {ENGINE_MODEL_ID}")
+    print(f"Engine: {ENGINE}")
+    if PUNCTUATOR is None:
+        print("Standalone punctuation model: disabled")
     print("All audio recognition runs locally. Press Ctrl+C to stop.")
 
     try:
